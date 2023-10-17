@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/faceair/drain"
+	"github.com/masslessparticle/drain"
 )
 
 func main() {
