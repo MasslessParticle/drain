@@ -1,14 +1,20 @@
 package drain
 
 import (
+	"bytes"
 	"fmt"
-	"math"
-	"strconv"
+	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"unicode"
-
-	"github.com/hashicorp/golang-lru/simplelru"
 )
+
+const numDelim = "<:NUM:>"
+
+// I wonder if it's useful to tokenize first then replace?
+// I can do this test
+var numReplace = regexp.MustCompile(`\b[0-9]+(:?\.[0-9]+)?\b`)
 
 type Config struct {
 	maxNodeDepth    int
@@ -21,63 +27,81 @@ type Config struct {
 }
 
 type LogCluster struct {
-	logTemplateTokens []string
-	id                int
-	size              int
+	Tokens []string `json:""`
+	ID     int      `json:""`
+	Size   int      `json:""`
 }
 
 func (c *LogCluster) getTemplate() string {
-	return strings.Join(c.logTemplateTokens, " ")
+	return strings.Join(c.Tokens, " ")
 }
 func (c *LogCluster) String() string {
-	return fmt.Sprintf("id={%d} : size={%d} : %s", c.id, c.size, c.getTemplate())
+	return fmt.Sprintf("%d\t%d\t%s", c.ID, c.Size, c.getTemplate())
 }
 
 func createLogClusterCache(maxSize int) *LogClusterCache {
-	if maxSize == 0 {
-		maxSize = math.MaxInt
-	}
-	cache, _ := simplelru.NewLRU(maxSize, nil)
 	return &LogClusterCache{
-		cache: cache,
+		cache: make(map[int]*LogCluster),
 	}
 }
 
 type LogClusterCache struct {
-	cache simplelru.LRUCache
+	lock  sync.RWMutex
+	cache map[int]*LogCluster
+}
+
+func (c *LogClusterCache) Len() int {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return len(c.cache)
 }
 
 func (c *LogClusterCache) Values() []*LogCluster {
-	values := make([]*LogCluster, 0)
-	for _, key := range c.cache.Keys() {
-		if value, ok := c.cache.Peek(key); ok {
-			values = append(values, value.(*LogCluster))
-		}
+	// This should not be operating on pointers
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	vals := make([]*LogCluster, 0, len(c.cache))
+	for _, v := range c.cache {
+		vals = append(vals, v)
 	}
-	return values
+	return vals
 }
 
 func (c *LogClusterCache) Set(key int, cluster *LogCluster) {
-	c.cache.Add(key, cluster)
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.cache[key] = cluster
 }
 
 func (c *LogClusterCache) Get(key int) *LogCluster {
-	cluster, ok := c.cache.Get(key)
-	if !ok {
-		return nil
-	}
-	return cluster.(*LogCluster)
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	return c.cache[key]
 }
 
 func createNode() *Node {
 	return &Node{
 		keyToChildNode: make(map[string]*Node),
-		clusterIDs:     make([]int, 0),
+		clusterIDs:     make([]int, 0, 1024),
+	}
+}
+
+func createRootNode() *RootNode {
+	return &RootNode{
+		keyToChildNode: make(map[int]*Node),
+		clusterIDs:     make([]int, 0, 1024),
 	}
 }
 
 type Node struct {
 	keyToChildNode map[string]*Node
+	clusterIDs     []int
+}
+
+type RootNode struct {
+	keyToChildNode map[int]*Node
 	clusterIDs     []int
 }
 
@@ -98,15 +122,16 @@ func New(config *Config) *Drain {
 
 	d := &Drain{
 		config:      config,
-		rootNode:    createNode(),
+		rootNode:    createRootNode(),
 		idToCluster: createLogClusterCache(config.MaxClusters),
 	}
 	return d
 }
 
 type Drain struct {
+	lock            sync.RWMutex
 	config          *Config
-	rootNode        *Node
+	rootNode        *RootNode
 	idToCluster     *LogClusterCache
 	clustersCounter int
 }
@@ -115,8 +140,27 @@ func (d *Drain) Clusters() []*LogCluster {
 	return d.idToCluster.Values()
 }
 
+func (d *Drain) ClusterLen() int {
+	return d.idToCluster.Len()
+}
+
+func (d *Drain) WriteToFile() {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	buf := &bytes.Buffer{}
+
+	fmt.Fprintln(buf, "ID\tSize\tTemplate")
+	for _, c := range d.Clusters() {
+		fmt.Fprintln(buf, c.String())
+	}
+
+	os.WriteFile("drain_templates", buf.Bytes(), 6044)
+}
+
 func (d *Drain) Train(content string) *LogCluster {
-	contentTokens := d.getContentAsTokens(content)
+	maasked := numReplace.ReplaceAllString(content, numDelim)
+	contentTokens := d.getContentAsTokens(maasked)
 
 	matchCluster := d.treeSearch(d.rootNode, contentTokens, d.config.SimTh, false)
 	// Match no existing log cluster
@@ -124,18 +168,18 @@ func (d *Drain) Train(content string) *LogCluster {
 		d.clustersCounter++
 		clusterID := d.clustersCounter
 		matchCluster = &LogCluster{
-			logTemplateTokens: contentTokens,
-			id:                clusterID,
-			size:              1,
+			Tokens: contentTokens,
+			ID:     clusterID,
+			Size:   1,
 		}
 		d.idToCluster.Set(clusterID, matchCluster)
 		d.addSeqToPrefixTree(d.rootNode, matchCluster)
 	} else {
-		newTemplateTokens := d.createTemplate(contentTokens, matchCluster.logTemplateTokens)
-		matchCluster.logTemplateTokens = newTemplateTokens
-		matchCluster.size++
+		newTemplateTokens := d.createTemplate(contentTokens, matchCluster.Tokens)
+		matchCluster.Tokens = newTemplateTokens
+		matchCluster.Size++
 		// Touch cluster to update its state in the cache.
-		d.idToCluster.Get(matchCluster.id)
+		d.idToCluster.Get(matchCluster.ID)
 	}
 	return matchCluster
 }
@@ -155,11 +199,14 @@ func (d *Drain) getContentAsTokens(content string) []string {
 	return strings.Split(content, " ")
 }
 
-func (d *Drain) treeSearch(rootNode *Node, tokens []string, simTh float64, includeParams bool) *LogCluster {
+func (d *Drain) treeSearch(rootNode *RootNode, tokens []string, simTh float64, includeParams bool) *LogCluster {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
 	tokenCount := len(tokens)
 
 	// at first level, children are grouped by token (word) count
-	curNode, ok := rootNode.keyToChildNode[strconv.Itoa(tokenCount)]
+	curNode, ok := rootNode.keyToChildNode[tokenCount]
 
 	// no template with same token count yet
 	if !ok {
@@ -213,7 +260,7 @@ func (d *Drain) fastMatch(clusterIDs []int, tokens []string, simTh float64, incl
 		if cluster == nil {
 			continue
 		}
-		curSim, paramCount := d.getSeqDistance(cluster.logTemplateTokens, tokens, includeParams)
+		curSim, paramCount := d.getSeqDistance(cluster.Tokens, tokens, includeParams)
 		if curSim > maxSim || (curSim == maxSim && paramCount > maxParamCount) {
 			maxSim = curSim
 			maxParamCount = paramCount
@@ -249,36 +296,30 @@ func (d *Drain) getSeqDistance(seq1, seq2 []string, includeParams bool) (float64
 	return retVal, paramCount
 }
 
-func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
-	tokenCount := len(cluster.logTemplateTokens)
-	tokenCountStr := strconv.Itoa(tokenCount)
+func (d *Drain) addSeqToPrefixTree(rootNode *RootNode, cluster *LogCluster) {
+	d.lock.Lock()
+	defer d.lock.Unlock()
 
-	firstLayerNode, ok := rootNode.keyToChildNode[tokenCountStr]
+	tokenCount := len(cluster.Tokens)
+
+	firstLayerNode, ok := rootNode.keyToChildNode[tokenCount]
 	if !ok {
 		firstLayerNode = createNode()
-		rootNode.keyToChildNode[tokenCountStr] = firstLayerNode
+		rootNode.keyToChildNode[tokenCount] = firstLayerNode
 	}
 	curNode := firstLayerNode
 
 	// handle case of empty log string
 	if tokenCount == 0 {
-		curNode.clusterIDs = append(curNode.clusterIDs, cluster.id)
+		curNode.clusterIDs = append(curNode.clusterIDs, cluster.ID)
 		return
 	}
 
 	currentDepth := 1
-	for _, token := range cluster.logTemplateTokens {
+	for _, token := range cluster.Tokens {
 		// if at max depth or this is last token in template - add current log cluster to the leaf node
 		if (currentDepth >= d.config.maxNodeDepth) || currentDepth >= tokenCount {
-			// clean up stale clusters before adding a new one.
-			newClusterIDs := make([]int, 0, len(curNode.clusterIDs))
-			for _, clusterID := range curNode.clusterIDs {
-				if d.idToCluster.Get(clusterID) != nil {
-					newClusterIDs = append(newClusterIDs, clusterID)
-				}
-			}
-			newClusterIDs = append(newClusterIDs, cluster.id)
-			curNode.clusterIDs = newClusterIDs
+			curNode.clusterIDs = append(curNode.clusterIDs, cluster.ID)
 			break
 		}
 

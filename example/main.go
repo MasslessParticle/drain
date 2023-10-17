@@ -1,34 +1,48 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/faceair/drain"
 )
 
 func main() {
 	logger := drain.New(drain.DefaultConfig())
-
-	for _, line := range []string{
-		"connected to 10.0.0.1",
-		"connected to 10.0.0.2",
-		"connected to 10.0.0.3",
-		"Hex number 0xDEADBEAF",
-		"Hex number 0x10000",
-		"user davidoh logged in",
-		"user eranr logged in",
-	} {
-		logger.Train(line)
+	f, err := os.Open("")
+	if err != nil {
+		panic(err)
 	}
 
-	for _, cluster := range logger.Clusters() {
-		println(cluster.String())
+	start := time.Now()
+
+	var lineNum uint64
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		logger.Train(sc.Text())
+		lineNum++
+		if lineNum%10000 == 0 {
+			fmt.Printf("Processing line: %d, %d clusters so far\n", lineNum, logger.ClusterLen())
+		}
+
+		if lineNum >= 1000000 {
+			break
+		}
 	}
 
-	cluster := logger.Match("user faceair logged in")
-	if cluster == nil {
-		println("no match")
-	} else {
-		fmt.Printf("cluster matched: %s", cluster.String())
-	}
+	logger.WriteToFile()
+	fmt.Println(time.Since(start))
+
+	//for _, cluster := range logger.Clusters() {
+	//	println(cluster.String())
+	//}
+	//
+	//cluster := logger.Match("user faceair logged in")
+	//if cluster == nil {
+	//	println("no match")
+	//} else {
+	//	fmt.Printf("cluster matched: %s", cluster.String())
+	//}
 }
