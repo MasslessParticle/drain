@@ -1,4 +1,4 @@
-module github.com/faceair/drain
+module github.com/masslessparticle/drain
 
 go 1.17
 
