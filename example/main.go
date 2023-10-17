@@ -3,10 +3,9 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"github.com/masslessparticle/drain"
 	"os"
 	"time"
-
-	"github.com/masslessparticle/drain"
 )
 
 func main() {
